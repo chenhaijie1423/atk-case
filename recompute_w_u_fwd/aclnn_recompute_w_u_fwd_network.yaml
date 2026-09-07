@@ -1,0 +1,160 @@
+api: pytorch
+api_type: executor_recompute_w_u_fwd
+version: v2.1
+name: aclnn.recompute.w.u.fwd.network
+aclnn_name: RecomputeWUFwd
+generate: generator_recompute_w_u_fwd_network
+dtype_numbers: 20
+extra_numbers: 0
+standard:
+  acc:
+    cv_fused_double_benchmark:
+      max_re_ratio: 5
+      avg_re_ratio: 1.5
+      root_mean_squared_ratio: 1.5
+inputs:
+  - name: k
+    type: tensor
+    required: true
+    dtypes:
+      values: [bf16, fp16]
+    ranges:
+      valid:
+        values: [ [ -5, 5 ] ]
+      invalid:
+        values: []
+    shapes:
+      dim_numbers:
+        values: [ 4 ]
+      dim_values:
+        values: [ [ 1, 100 ], [ 1, 32 ], [ 1, 100 ], [ 1, 100 ] ]
+  - name: v
+    type: tensor
+    required: true
+    dtypes:
+      values: [bf16, fp16]
+    ranges:
+      valid:
+        values: [ [ -5, 5 ] ]
+      invalid:
+        values: []
+    shapes:
+      dim_numbers:
+        values: [ 4 ]
+      dim_values:
+        values: [ [ 1, 100 ], [ 1, 32 ], [ 1, 100 ], [ 1, 100 ] ]
+  - name: beta
+    type: tensor
+    required: true
+    dtypes:
+      values: [fp32, bf16, fp16]
+    ranges:
+      valid:
+        values: [ [ -5, 5 ] ]
+      invalid:
+        values: []
+    shapes:
+      dim_numbers:
+        values: [ 3 ]
+      dim_values:
+        values: [ [ 1, 100 ], [ 1, 32 ], [ 1, 100 ] ]
+  - name: A
+    type: tensor
+    required: true
+    dtypes:
+      values: [bf16, fp16]
+    ranges:
+      valid:
+        values: [ [ -5, 5 ] ]
+      invalid:
+        values: []
+    shapes:
+      dim_numbers:
+        values: [ 4 ]
+      dim_values:
+        values: [ [ 1, 100 ], [ 1, 32 ], [ 1, 100 ], [ 64, 128 ] ]
+  - name: g
+    type: tensor
+    required: true
+    dtypes:
+      values: [fp32, bf16, fp16]
+    ranges:
+      valid:
+        values: [ [ -5, 5 ] ]
+      invalid:
+        values: []
+    shapes:
+      dim_numbers:
+        values: [ 3 ]
+      dim_values:
+        values: [ [ 1, 100 ], [ 1, 32 ], [ 1, 100 ] ]
+  - name: cu_seqlens
+    type: tensor
+    required: true
+    dtypes:
+      values: [int64]
+    ranges:
+      valid:
+        values: [ [ 1, 4096 ] ]
+      invalid:
+        values: []
+    shapes:
+      dim_numbers:
+        values: [ 1 ]
+      dim_values:
+        values: [ [ 1, 16 ] ]
+  - name: chunk_indices
+    type: tensor
+    required: true
+    dtypes:
+      values: [int64]
+    ranges:
+      valid:
+        values: [ [ 1, 100 ] ]
+      invalid:
+        values: []
+    shapes:
+      dim_numbers:
+        values: [ 2 ]
+      dim_values:
+        values: [ [ 1, 100 ], 2 ]
+  - name: chunk_size
+    type: attr
+    required: true
+    dtypes:
+      values: [int]
+    ranges:
+      valid:
+        values: [64, 128]
+      invalid:
+        values: []
+  - name: beta_type
+    type: attr
+    required: true
+    dtypes:
+      values: [string]
+    ranges:
+      valid:
+        values: ["fp32", "bf16", "fp16"]
+      invalid:
+        values: []
+  - name: is_fix
+    type: attr
+    required: true
+    dtypes:
+      values: [bool]
+    ranges:
+      valid:
+        values: [true, false]
+      invalid:
+        values: []
+  - name: qkv_type
+    type: attr
+    required: true
+    dtypes:
+      values: [string]
+    ranges:
+      valid:
+        values: ["bf16", "fp16"]
+      invalid:
+        values: []
