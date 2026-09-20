@@ -4,6 +4,9 @@ import os
 from typing import Tuple, Optional, List
 import time
 
+# 避免在循环中反复调用 torch.set_num_threads() 导致线程池反复销毁/重建而卡死
+_cpu_threads_once = False
+
 # ---------------------------------------------------------------------------
 # 耗时统计工具（仅诊断用，不影响计算结果）
 # 通过 recompute_w_u_fwd_cpu(..., verbose_timing=True) 或环境变量
@@ -262,8 +265,10 @@ def recompute_w_u_fwd_cpu(
               f"n_ratio={n_ratio} chunk_size={chunk_size} mode={mode} benchmark={benchmark}")
     # 小矩阵 bmm 场景：多线程 BLAS 的 spawn/join 开销远超实际计算。
     # 降为 1 线程消除开销，单线程 BLAS 对小矩阵 cache 更友好。
-    _saved_num_threads = torch.get_num_threads()
-    torch.set_num_threads(1)
+    global _cpu_threads_once
+    if not _cpu_threads_once:
+        _cpu_threads_once = True
+        torch.set_num_threads(1)
     timer.start("main_loop")
     if cu_seqlens is None:
         # Dense 模式：T 按 chunk_size 切分
@@ -302,5 +307,4 @@ def recompute_w_u_fwd_cpu(
     if summary:
         print(summary)
 
-    torch.set_num_threads(_saved_num_threads)
     return w, u
