@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import math
 import sys
-import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 import copy
@@ -26,50 +25,6 @@ import ctypes
 
 # 避免在循环中反复调用 torch.set_num_threads() 导致线程池反复销毁/重建而卡死
 _cpu_threads_once = False
-
-
-def _sync_device(device: torch.device):
-    """GPU 计时前同步，避免异步 launch 导致耗时被低估。"""
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
-def _new_timer() -> Dict[str, float]:
-    return {}
-
-
-def _tick(timer: Dict[str, float], key: str, device: torch.device):
-    """记录某个阶段开始/结束时刻，累加到 timer[key]。"""
-    _sync_device(device)
-    timer.setdefault(key, 0.0)
-    timer[f"__last_{key}"] = time.perf_counter()
-
-
-def _tock(timer: Dict[str, float], key: str, device: torch.device):
-    _sync_device(device)
-    timer[key] = timer.get(key, 0.0) + (time.perf_counter() - timer.pop(f"__last_{key}", 0.0))
-
-
-def _tick_ns(timer: Dict[str, float], key: str):
-    """循环内细粒度计时（不同步 GPU），累加 dispatch+launch 耗时。"""
-    timer.setdefault(key, 0.0)
-    timer[f"__last_{key}"] = time.perf_counter()
-
-
-def _tock_ns(timer: Dict[str, float], key: str):
-    timer[key] = timer.get(key, 0.0) + (time.perf_counter() - timer.pop(f"__last_{key}", 0.0))
-
-
-def _print_timer(timer: Dict[str, float]):
-    total = sum(v for k, v in timer.items() if not k.startswith("__"))
-    if total <= 0:
-        return
-    print(f"[chunk_gated_delta_rule_bwd_dhu_golden] 耗时统计（总计 {total*1000:.2f} ms）：", flush=True)
-    for key, val in sorted(timer.items(), key=lambda kv: kv[1], reverse=True):
-        if key.startswith("__"):
-            continue
-        pct = (val / total * 100.0) if total > 0 else 0.0
-        print(f"  - {key:<32s}: {val*1000:8.2f} ms ({pct:5.1f}%)", flush=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
 
@@ -269,7 +224,6 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
             return x
         return x.to(dtype_).to(compute_dtype)
     device = q.device
-    _timer = _new_timer()
     B, Hk, T, K = q.shape
     Hv = dO.shape[1]
     V = dO.shape[-1]
@@ -291,18 +245,15 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
         NT = (T + BT - 1) // BT
         varlen = False
 
-    _tick(_timer, "01_dtype_convert", device)
     qf = q.to(compute_dtype)
     kf = k.to(compute_dtype)
     wf = w.to(compute_dtype)
     dof = dO.to(compute_dtype)
     dvf = dv.to(compute_dtype)
     gf = g.to(compute_dtype)
-    _tock(_timer, "01_dtype_convert", device)
 
     def gate_exp(x: torch.Tensor) -> torch.Tensor:
         return torch.exp(x * _LN2) if use_exp2 else torch.exp(x)
-    _tick(_timer, "02_buffer_init", device)
     # dh/dv2 输出 dtype 与 q 一致：低位宽轮（bf16/fp16）与 NPU 输出 dtype
     # 对齐（ATK 双标杆的 local/remote dtype 检查），升精度轮为 fp32。
     dh = torch.zeros(B, Hv, NT, K, V, device=device, dtype=dtype_)
@@ -311,17 +262,14 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
     num_tokens = len(cu_seqlens) - 1 if varlen else 1
     b_dh_buffers = torch.zeros(B, Hv, num_tokens, K, V, device=device, dtype=compute_dtype)
     b_dh = torch.zeros(B, Hv, K, V, device=device, dtype=compute_dtype)
-    _tock(_timer, "02_buffer_init", device)
 
     # ---- 循环外预计算：参考 recompute_w_u_fwd_cpu 的 batched bmm 模式 ----
-    _tick(_timer, "03_gva_repeat_interleave", device)
     # GVA 头扩展：repeat_interleave 一次替代 NT 次 index_select
     if hv_per_hk > 1:
         kf = kf.repeat_interleave(hv_per_hk, dim=1)
         qf = qf.repeat_interleave(hv_per_hk, dim=1)
     # gf 转 float32 整序列一次完成
     g_seq = gf[:, :, :T].to(torch.float32)  # [B, Hv, T]
-    _tock(_timer, "03_gva_repeat_interleave", device)
 
     # 定长模式下，将满 chunk 数据 reshape 为 [B, Hv, n_full, BT, D] 批量预计算 gate 和 term1；
     # 变长模式 chunk 不连续，走原 per-chunk 路径。
@@ -329,7 +277,6 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
     n_full = T // BT if not varlen else 0
     term1_full = gate_factor_full = exp_bg_last_full = dv2_full_pre = None
     if n_full > 0:
-        _tick(_timer, "04_precompute_full", device)
         T_full = n_full * BT
         # ---- Gate 批量预计算（3 次 gate_exp 替代 3*n_full 次）----
         g_full = g_seq[:, :, :T_full].reshape(B, Hv, n_full, BT)                     # [B, Hv, n_full, BT]
@@ -357,9 +304,6 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
         # dv2 延迟写回缓冲：循环内按 chunk 写 compute_dtype（省 .to(dtype_) kernel），
         # 循环后一次性批量转换 + 写回 dv2（1 个 kernel 替代 n_full 个）。
         dv2_full_pre = torch.empty(B, Hv, n_full, BT, V, device=device, dtype=compute_dtype)
-        _tock(_timer, "04_precompute_full", device)
-
-    _tick(_timer, "05_loop_total", device)
     for i_t in range(NT - 1, -1, -1):
         if varlen:
             i_n = chunk_indices[i_t * 2]
@@ -383,7 +327,6 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
 
         # 满 chunk 走预计算分支；ragged tail / varlen 走原 per-chunk 分支
         if not varlen and i_t < n_full:
-            _tick_ns(_timer, "06_loop_slice")
             b_idx = i_t
             k_blk = kf_full[:, :, b_idx, :, :]          # [B, Hv, BT, K]
             w_blk = wf_full[:, :, b_idx, :, :]          # [B, Hv, BT, K]
@@ -391,37 +334,19 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
             gate_factor = gate_factor_full[:, :, b_idx, :, :]  # [B, Hv, BT, 1]
             exp_bg_last = exp_bg_last_full[:, :, b_idx]         # [B, Hv]
             term1 = term1_full[:, :, b_idx, :, :]                # [B, Hv, K, V]
-            _tock_ns(_timer, "06_loop_slice")
 
-            _tick_ns(_timer, "08_loop_round_dt")
             b_dh_rd = round_dt(b_dh)
-            _tock_ns(_timer, "08_loop_round_dt")
-            _tick_ns(_timer, "07_loop_matmul")
             b_dv = k_blk @ b_dh_rd
-            _tock_ns(_timer, "07_loop_matmul")
-            _tick_ns(_timer, "08_loop_round_dt")
             b_dv = round_dt(b_dv)
-            _tock_ns(_timer, "08_loop_round_dt")
-            _tick_ns(_timer, "09_loop_elem")
             b_dv = b_dv * gate_factor + b_dv_existing
             dv2_full_pre[:, :, i_t] = b_dv
             b_dh_for_update = b_dh * exp_bg_last.unsqueeze(-1).unsqueeze(-1)
-            _tock_ns(_timer, "09_loop_elem")
-            _tick_ns(_timer, "08_loop_round_dt")
             b_dv_rd = round_dt(b_dv)
-            _tock_ns(_timer, "08_loop_round_dt")
-            _tick_ns(_timer, "07_loop_matmul")
             term2 = w_blk.transpose(-1, -2) @ b_dv_rd
-            _tock_ns(_timer, "07_loop_matmul")
-            _tick_ns(_timer, "08_loop_round_dt")
             term2 = round_dt(term2)
-            _tock_ns(_timer, "08_loop_round_dt")
-            _tick_ns(_timer, "09_loop_elem")
             b_dh = b_dh_for_update + term1 - term2
-            _tock_ns(_timer, "09_loop_elem")
         else:
             # --- 变长 / ragged tail：per-chunk 路径（保留原始 gate_exp 计算顺序）---
-            _tick_ns(_timer, "06_loop_slice")
             k_blk = kf[:, :, gs:ge, :]
             q_blk_ = qf[:, :, gs:ge, :]  # kf/qf 已在循环外 repeat_interleave 展开 GVA
             w_blk = wf[:, :, gs:ge, :]
@@ -430,68 +355,34 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
 
             bg_last = g_seq[:, :, global_last_idx]
             b_g = g_seq[:, :, gs:ge]
-            _tock_ns(_timer, "06_loop_slice")
 
-            _tick_ns(_timer, "10_loop_gate")
             gate_factor = gate_exp(bg_last.unsqueeze(-1) - b_g).unsqueeze(-1)       # [B, Hv, bt, 1]
-            _tock_ns(_timer, "10_loop_gate")
 
             # ---- dvState ----
-            _tick_ns(_timer, "08_loop_round_dt")
             b_dh_rd = round_dt(b_dh)
-            _tock_ns(_timer, "08_loop_round_dt")
-            _tick_ns(_timer, "07_loop_matmul")
             b_dv = k_blk @ b_dh_rd
-            _tock_ns(_timer, "07_loop_matmul")
-            _tick_ns(_timer, "08_loop_round_dt")
             b_dv = round_dt(b_dv)
-            _tock_ns(_timer, "08_loop_round_dt")
-            _tick_ns(_timer, "09_loop_elem")
             b_dv = b_dv * gate_factor + b_dv_existing
             dv2[:, :, gs:ge, :] = b_dv.to(dtype_)
-            _tock_ns(_timer, "09_loop_elem")
 
-            _tick_ns(_timer, "10_loop_gate")
             b_dh_for_update = b_dh * gate_exp(bg_last).unsqueeze(-1).unsqueeze(-1)
             b_q_gated = q_blk_.transpose(-1, -2) * gate_exp(b_g).unsqueeze(-2)
-            _tock_ns(_timer, "10_loop_gate")
-            _tick_ns(_timer, "08_loop_round_dt")
             b_q_gated_rd = round_dt(b_q_gated)
-            _tock_ns(_timer, "08_loop_round_dt")
-            _tick_ns(_timer, "07_loop_matmul")
             term1 = b_q_gated_rd @ b_do
-            _tock_ns(_timer, "07_loop_matmul")
-            _tick_ns(_timer, "08_loop_round_dt")
             term1 = round_dt(term1)
-            _tock_ns(_timer, "08_loop_round_dt")
-            _tick_ns(_timer, "09_loop_elem")
             term1 = term1 * scale_f
-            _tock_ns(_timer, "09_loop_elem")
-            _tick_ns(_timer, "08_loop_round_dt")
             b_dv_rd = round_dt(b_dv)
-            _tock_ns(_timer, "08_loop_round_dt")
-            _tick_ns(_timer, "07_loop_matmul")
             term2 = w_blk.transpose(-1, -2) @ b_dv_rd
-            _tock_ns(_timer, "07_loop_matmul")
-            _tick_ns(_timer, "08_loop_round_dt")
             term2 = round_dt(term2)
-            _tock_ns(_timer, "08_loop_round_dt")
-            _tick_ns(_timer, "09_loop_elem")
             b_dh = b_dh_for_update + term1 - term2
             if varlen:
                 b_dh_buffers[:, :, i_n, :, :] = b_dh
-            _tock_ns(_timer, "09_loop_elem")
             continue
 
-    _tock(_timer, "05_loop_total", device)
-
     if dv2_full_pre is not None:
-        _tick(_timer, "11_dv2_batch_writeback", device)
         T_full = n_full * BT
         dv2[:, :, :T_full, :] = dv2_full_pre.reshape(B, Hv, T_full, V).to(dtype_)
-        _tock(_timer, "11_dv2_batch_writeback", device)
 
-    _print_timer(_timer)
     return dh, dv2
 
 
