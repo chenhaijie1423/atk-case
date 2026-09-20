@@ -24,6 +24,9 @@ import torch
 import os
 import ctypes
 
+# 避免在循环中反复调用 torch.set_num_threads() 导致线程池反复销毁/重建而卡死
+_cpu_threads_once = False
+
 
 def _sync_device(device: torch.device):
     """GPU 计时前同步，避免异步 launch 导致耗时被低估。"""
@@ -324,7 +327,7 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
     # 变长模式 chunk 不连续，走原 per-chunk 路径。
     _ragged = T % BT
     n_full = T // BT if not varlen else 0
-    term1_full = gate_factor_full = exp_bg_last_full = None
+    term1_full = gate_factor_full = exp_bg_last_full = dv2_full_pre = None
     if n_full > 0:
         _tick(_timer, "04_precompute_full", device)
         T_full = n_full * BT
@@ -351,6 +354,9 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
         kf_full = kf[:, :, :T_full].reshape(B, Hv, n_full, BT, K)
         wf_full = wf[:, :, :T_full].reshape(B, Hv, n_full, BT, K)
         dvf_full = dvf[:, :, :T_full].reshape(B, Hv, n_full, BT, V)
+        # dv2 延迟写回缓冲：循环内按 chunk 写 compute_dtype（省 .to(dtype_) kernel），
+        # 循环后一次性批量转换 + 写回 dv2（1 个 kernel 替代 n_full 个）。
+        dv2_full_pre = torch.empty(B, Hv, n_full, BT, V, device=device, dtype=compute_dtype)
         _tock(_timer, "04_precompute_full", device)
 
     _tick(_timer, "05_loop_total", device)
@@ -398,7 +404,7 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
             _tock_ns(_timer, "08_loop_round_dt")
             _tick_ns(_timer, "09_loop_elem")
             b_dv = b_dv * gate_factor + b_dv_existing
-            dv2[:, :, gs:ge, :] = b_dv.to(dtype_)
+            dv2_full_pre[:, :, i_t] = b_dv
             b_dh_for_update = b_dh * exp_bg_last.unsqueeze(-1).unsqueeze(-1)
             _tock_ns(_timer, "09_loop_elem")
             _tick_ns(_timer, "08_loop_round_dt")
@@ -478,6 +484,12 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
             continue
 
     _tock(_timer, "05_loop_total", device)
+
+    if dv2_full_pre is not None:
+        _tick(_timer, "11_dv2_batch_writeback", device)
+        T_full = n_full * BT
+        dv2[:, :, :T_full, :] = dv2_full_pre.reshape(B, Hv, T_full, V).to(dtype_)
+        _tock(_timer, "11_dv2_batch_writeback", device)
 
     _print_timer(_timer)
     return dh, dv2
@@ -587,6 +599,10 @@ class FunctionApi(BaseApi):
                     golden=False,
                 )
             elif self.device == "cpu" or self.device == "gpu":
+                global _cpu_threads_once
+                if not _cpu_threads_once:
+                    _cpu_threads_once = True
+                    torch.set_num_threads(1)
                 dh, dv2 = chunk_gated_delta_rule_bwd_dhu_golden(
                     q, k, w, dO, dv, g, scale, chunk_size,
                     use_exp2=use_exp2, cu_seqlens=cu_seqlens,
