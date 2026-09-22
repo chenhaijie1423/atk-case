@@ -24,7 +24,7 @@ import os
 import ctypes
 
 # 避免在循环中反复调用 torch.set_num_threads() 导致线程池反复销毁/重建而卡死
-_cpu_threads_once = False
+torch.set_num_threads(64)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
 
@@ -490,10 +490,6 @@ class FunctionApi(BaseApi):
                     golden=False,
                 )
             elif self.device == "cpu" or self.device == "gpu":
-                global _cpu_threads_once
-                if not _cpu_threads_once:
-                    _cpu_threads_once = True
-                    torch.set_num_threads(1)
                 dh, dv2 = chunk_gated_delta_rule_bwd_dhu_golden(
                     q, k, w, dO, dv, g, scale, chunk_size,
                     use_exp2=use_exp2, cu_seqlens=cu_seqlens,
