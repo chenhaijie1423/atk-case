@@ -12,6 +12,7 @@ CPU 标杆为本文件内自包含实现（定长与变长路径，不跨文件�
 （输入 fp32）以纯 fp64 计算；NPU DUT 走
 fla_npu.ops.ascendc.chunk_gated_delta_rule_bwd_dhu。
 """
+# numactl --cpunodebind=0,1 --membind=0,1
 from __future__ import annotations
 
 import math
@@ -402,6 +403,7 @@ class FunctionApi(BaseApi):
         self.high_precision = self.device == "cpu"
 
     def init_by_input_data(self, input_data: InputDataset):
+        t0 = time.perf_counter()
         q = input_data.kwargs["q"]
         dO = input_data.kwargs["dO"]
         device = q.device
@@ -411,6 +413,7 @@ class FunctionApi(BaseApi):
         chunk_size = _to_int(input_data.kwargs.get("chunkSize"), default=64)
         use_exp2 = _to_bool(input_data.kwargs.get("use_exp2", False))
         is_fix = _to_bool(input_data.kwargs.get("is_fix", True))
+        t1 = time.perf_counter()
         # ATK 按 YAML 生成的张量取值不满足本算子输入约束（g 需沿 T 单调递减，
         # 否则 exp(bg_last - bg) 上溢），因此按参考分布以固定种子在 CPU 重建
         # 全部输入，再按节点设备搬运，保证 CPU 标杆与 NPU DUT 输入逐位一致。
@@ -425,10 +428,13 @@ class FunctionApi(BaseApi):
             num_seqs = max(1, min(4, int(T) // 128))
             cu_seqlens = _generate_cu_seqlens(int(T), num_seqs)
             chunk_indices = _prepare_chunk_indices(cu_seqlens, chunk_size)
+        t2 = time.perf_counter()
         inputs = _build_case_inputs(
             B_use, int(HK), int(HV), int(T), int(K), int(V), q.dtype)
+        t3 = time.perf_counter()
         if self.device in ["pyaclnn", "npu"]:
             inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
+        t4 = time.perf_counter()
         input_data.kwargs["q"] = inputs["q"]
         input_data.kwargs["k"] = inputs["k"]
         input_data.kwargs["w"] = inputs["w"]
@@ -443,6 +449,7 @@ class FunctionApi(BaseApi):
         input_data.kwargs["chunkSize"] = chunk_size
         input_data.kwargs["use_exp2"] = use_exp2
         input_data.kwargs["is_fix"] = is_fix
+        t5 = time.perf_counter()
         if self.device == "pyaclnn":
 
             null_void_ptr = ctypes.c_void_p(None)
@@ -468,6 +475,18 @@ class FunctionApi(BaseApi):
 
             input_data.kwargs["scale"] = ctypes.c_double(1.0 / math.sqrt(inputs["q"].shape[-1]))
             del input_data.kwargs["is_fix"]
+
+        t_end = time.perf_counter()
+        print(
+            f"[{OP_NAME}] init_by_input_data 耗时(ms) | "
+            f"解析属性={1e3 * (t1 - t0):.3f} | "
+            f"cu_seqlens/indices={1e3 * (t2 - t1):.3f} | "
+            f"build_case_inputs={1e3 * (t3 - t2):.3f} | "
+            f"搬运to(device)={1e3 * (t4 - t3):.3f} | "
+            f"kwargs回写={1e3 * (t5 - t4):.3f} | "
+            f"pyaclnn_acl={1e3 * (t_end - t5):.3f} | "
+            f"总计={1e3 * (t_end - t0):.3f}"
+        )
 
     def __call__(self, input_data: InputDataset, with_output: bool = False):
         q = input_data.kwargs["q"]
