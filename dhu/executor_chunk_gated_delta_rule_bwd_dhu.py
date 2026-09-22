@@ -44,14 +44,9 @@ _LN2 = 0.69314718055994530942
 
 def _gate(shape):
     """生成沿 T 维单调递减的 GDN gate，避免 exp 溢出。"""
-    data = torch.rand(tuple(int(x) for x in shape) dtype=torch.float32) * 0.01 + 0.001
+    data = torch.rand(tuple(int(x) for x in shape), dtype=torch.float32) * 0.01 + 0.001
     data = -torch.cumsum(data, dim=-1)
     return data
-
-def _randn(shape, calc_dtype: torch.dtype, scale: float = 0.05):
-    """生成确定性正态分布输入；先量化到原始 dtype，再转到计算 dtype。"""
-    data = torch.randn(tuple(int(x) for x in shape), dtype=torch.float32) * float(scale)
-    return data.to(calc_dtype)
 
 def _to_int(value, default=None) -> int:
     """把 ATK 传入的 int/str/tensor 标量统一转成 Python int（None 时取 default）。"""
@@ -136,31 +131,6 @@ def _prepare_chunk_indices(cu_seqlens: List[int], chunk_size: int) -> List[int]:
             chunk_indices.append(seq_idx)
             chunk_indices.append(chunk_idx)
     return chunk_indices
-
-
-def _build_case_inputs(
-    B: int,
-    HK: int,
-    HV: int,
-    T: int,
-    K: int,
-    V: int,
-    dtype: torch.dtype,
-    seed: int = _DEFAULT_SEED,
-) -> dict:
-    """在 CPU 上按参考分布重建业务输入（固定种子，各节点逐位一致）。
-
-    q/k: [B,HK,T,K]；w: [B,HV,T,K]；dO/dv: [B,HV,T,V]；
-    g: [B,HV,T] 沿 T 单调递减（fp32），保证 exp(bg_last - bg) <= 1 不上溢。
-    """
-    return {
-        "q": _randn((B, HK, T, K), dtype),
-        "k": _randn((B, HK, T, K), dtype),
-        "w": _randn((B, HV, T, K), dtype),
-        "dO": _randn((B, HV, T, V), dtype),
-        "dv": _randn((B, HV, T, V), dtype),
-        "g": _gate((B, HV, T)),
-    }
 
 def chunk_gated_delta_rule_bwd_dhu_golden(
     q: torch.Tensor,
@@ -385,11 +355,13 @@ class FunctionApi(BaseApi):
             cu_seqlens = _generate_cu_seqlens(int(T), num_seqs)
             chunk_indices = _prepare_chunk_indices(cu_seqlens, chunk_size)
         t2 = time.perf_counter()
-        inputs = _build_case_inputs(
-            B_use, int(HK), int(HV), int(T), int(K), int(V), q.dtype)
+        q = (torch.randn((B, HK, T, K), dtype=torch.float32) * float(scale)).to(dtype).to(device)
+        k = (torch.randn((B, HK, T, K), dtype=torch.float32) * float(scale)).to(dtype).to(device)
+        w = (torch.randn((B, HV, T, K), dtype=torch.float32) * float(scale)).to(dtype).to(device)
+        d0 = (torch.randn((B, HV, T, V), dtype=torch.float32) * float(scale)).to(dtype).to(device)
+        dv = (torch.randn((B, HV, T, V), dtype=torch.float32) * float(scale)).to(dtype).to(device)
         t3 = time.perf_counter()
-        if self.device in ["pyaclnn", "npu"]:
-            inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
+        g = _gate((B, HV, T)).to(device)
         t4 = time.perf_counter()
         input_data.kwargs["q"] = inputs["q"]
         input_data.kwargs["k"] = inputs["k"]
@@ -438,7 +410,7 @@ class FunctionApi(BaseApi):
             f"解析属性={1e3 * (t1 - t0):.3f} | "
             f"cu_seqlens/indices={1e3 * (t2 - t1):.3f} | "
             f"build_case_inputs={1e3 * (t3 - t2):.3f} | "
-            f"搬运to(device)={1e3 * (t4 - t3):.3f} | "
+            f"build g={1e3 * (t4 - t3):.3f} | "
             f"kwargs回写={1e3 * (t5 - t4):.3f} | "
             f"pyaclnn_acl={1e3 * (t_end - t5):.3f} | "
             f"总计={1e3 * (t_end - t0):.3f}"
