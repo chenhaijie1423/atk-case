@@ -24,7 +24,7 @@ import os
 import ctypes
 
 # 避免在循环中反复调用 torch.set_num_threads() 导致线程池反复销毁/重建而卡死
-torch.set_num_threads(64)
+torch.set_num_threads(16)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
 
