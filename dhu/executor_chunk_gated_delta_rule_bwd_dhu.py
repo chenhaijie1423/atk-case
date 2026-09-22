@@ -41,37 +41,17 @@ from atk.tasks.backends.lib_interface.acl_wrapper import AclTensor, AclIntArray,
 OP_NAME = "chunk_gated_delta_rule_bwd_dhu"
 
 _LN2 = 0.69314718055994530942
-_DEFAULT_SEED = 20260817
 
-_DTYPE_NAMES = {
-    torch.bfloat16: "bf16",
-    torch.float16: "fp16",
-    torch.float32: "fp32",
-}
-
-_DTYPE_MAP = {
-    "bf16": torch.bfloat16,
-    "fp16": torch.float16,
-    "fp32": torch.float32,
-    "fp64": torch.float64,
-}
-def _gate(shape, calc_dtype: torch.dtype, device: torch.device, seed: int):
+def _gate(shape):
     """生成沿 T 维单调递减的 GDN gate，避免 exp 溢出。"""
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(int(seed))
-    data = torch.rand(tuple(int(x) for x in shape), generator=gen, dtype=torch.float32) * 0.01 + 0.001
+    data = torch.rand(tuple(int(x) for x in shape) dtype=torch.float32) * 0.01 + 0.001
     data = -torch.cumsum(data, dim=-1)
-    return data.to(calc_dtype).to(device)
-def _orig_dtype(name: str) -> torch.dtype:
-    """把 case_spec 中的 dtype 名称转成 torch dtype。"""
-    return _DTYPE_MAP.get(str(name).lower(), torch.bfloat16)
+    return data
 
-def _randn(shape, dtype_name: str, calc_dtype: torch.dtype, device: torch.device, seed: int, scale: float = 0.05):
+def _randn(shape, calc_dtype: torch.dtype, scale: float = 0.05):
     """生成确定性正态分布输入；先量化到原始 dtype，再转到计算 dtype。"""
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(int(seed))
-    data = torch.randn(tuple(int(x) for x in shape), generator=gen, dtype=torch.float32) * float(scale)
-    return data.to(_orig_dtype(dtype_name)).to(calc_dtype).to(device)
+    data = torch.randn(tuple(int(x) for x in shape), dtype=torch.float32) * float(scale)
+    return data.to(calc_dtype)
 
 def _to_int(value, default=None) -> int:
     """把 ATK 传入的 int/str/tensor 标量统一转成 Python int（None 时取 default）。"""
@@ -173,15 +153,13 @@ def _build_case_inputs(
     q/k: [B,HK,T,K]；w: [B,HV,T,K]；dO/dv: [B,HV,T,V]；
     g: [B,HV,T] 沿 T 单调递减（fp32），保证 exp(bg_last - bg) <= 1 不上溢。
     """
-    dtype_name = _DTYPE_NAMES.get(dtype, "bf16")
-    cpu = torch.device("cpu")
     return {
-        "q": _randn((B, HK, T, K), dtype_name, dtype, cpu, seed + 1),
-        "k": _randn((B, HK, T, K), dtype_name, dtype, cpu, seed + 2),
-        "w": _randn((B, HV, T, K), dtype_name, dtype, cpu, seed + 3),
-        "dO": _randn((B, HV, T, V), dtype_name, dtype, cpu, seed + 4),
-        "dv": _randn((B, HV, T, V), dtype_name, dtype, cpu, seed + 5),
-        "g": _gate((B, HV, T), torch.float32, cpu, seed + 6),
+        "q": _randn((B, HK, T, K), dtype),
+        "k": _randn((B, HK, T, K), dtype),
+        "w": _randn((B, HV, T, K), dtype),
+        "dO": _randn((B, HV, T, V), dtype),
+        "dv": _randn((B, HV, T, V), dtype),
+        "g": _gate((B, HV, T)),
     }
 
 def chunk_gated_delta_rule_bwd_dhu_golden(
@@ -380,6 +358,7 @@ class FunctionApi(BaseApi):
         self.high_precision = self.device == "cpu"
 
     def init_by_input_data(self, input_data: InputDataset):
+        torch.manual_seed(self.task_result.case_config.id)
         t0 = time.perf_counter()
         q = input_data.kwargs["q"]
         dO = input_data.kwargs["dO"]
