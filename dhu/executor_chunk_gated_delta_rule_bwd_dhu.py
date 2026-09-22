@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 import copy
@@ -70,24 +71,6 @@ def _randn(shape, dtype_name: str, calc_dtype: torch.dtype, device: torch.device
     gen.manual_seed(int(seed))
     data = torch.randn(tuple(int(x) for x in shape), generator=gen, dtype=torch.float32) * float(scale)
     return data.to(_orig_dtype(dtype_name)).to(calc_dtype).to(device)
-
-def _finite_tuple(outputs, *, golden: bool = False) -> Tuple[torch.Tensor, ...]:
-    """过滤 None 输出，规范 golden dtype，并检查浮点输出是否有限。"""
-    if isinstance(outputs, torch.Tensor):
-        outputs = (outputs,)
-    visible = []
-    for output in outputs:
-        if output is None or not isinstance(output, torch.Tensor):
-            continue
-        check = output.detach()
-        if check.is_floating_point() and not torch.isfinite(check.float()).all().item():
-            raise RuntimeError("输出包含 NaN 或 Inf")
-        if golden and output.dtype == torch.float64:
-            output = output.to(torch.float32)
-        elif golden and output.dtype == torch.complex128:
-            output = output.to(torch.complex64)
-        visible.append(output)
-    return tuple(visible)
 
 def _to_int(value, default=None) -> int:
     """把 ATK 传入的 int/str/tensor 标量统一转成 Python int（None 时取 default）。"""
@@ -213,6 +196,7 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
     cu_seqlens: Optional[List[int]] = None,
     chunk_indices: Optional[List[int]] = None,
 ) -> tuple:
+    t0 = time.perf_counter()
     dtype_ = q.dtype
     # 双标杆精度分层：低位宽轮（fp16/bf16 输入）fp32 计算，升精度轮（fp32 输入）fp64 计算。
     compute_dtype = torch.float64 if dtype_ == torch.float32 else torch.float32
@@ -405,6 +389,8 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
         dv2[:, :, :T_full, :] = dv2_full_pre.reshape(B, Hv, T_full, V).to(dtype_)
 
     dh = dh_states.to(dtype_)
+    print(f"[{OP_NAME}] chunk_gated_delta_rule_bwd_dhu_golden 总耗时: "
+          f"{time.perf_counter() - t0:.6f} s")
     return dh, dv2
 
 
@@ -502,7 +488,7 @@ class FunctionApi(BaseApi):
             if self.device in {"npu", "pyaclnn"}:
                 from fla_npu.ops import ascendc
 
-                dh, dv2 = ascendc.chunk_gated_delta_rule_bwd_dhu(
+                dh, dh0, dv2 = ascendc.chunk_gated_delta_rule_bwd_dhu(
                     q, k, w, dO, dv, scale, chunk_size,
                     g=g, gK=None, h0=None, dht=None,
                     cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
