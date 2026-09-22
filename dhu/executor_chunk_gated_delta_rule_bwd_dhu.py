@@ -304,8 +304,56 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
         # dv2 延迟写回缓冲：循环内按 chunk 写 compute_dtype（省 .to(dtype_) kernel），
         # 循环后一次性批量转换 + 写回 dv2（1 个 kernel 替代 n_full 个）。
         dv2_full_pre = torch.empty(B, Hv, n_full, BT, V, device=device, dtype=compute_dtype)
-    for i_t in range(NT - 1, -1, -1):
-        if varlen:
+    # ---- 预展开常量，消除循环内 unsqueeze / transpose ----
+    if n_full > 0:
+        exp_bg_last_expanded = exp_bg_last_full.unsqueeze(-1).unsqueeze(-1)  # [B, Hv, n_full, 1, 1]
+        wf_full_T = wf_full.transpose(-1, -2).contiguous()                  # [B, Hv, n_full, K, BT]
+
+    # ---- fp64 模式：预计算合并矩阵 A, B（两轮 matmul → 一轮）----
+    # 推导（round_dt 为恒等时）：
+    #   b_dv = (k_blk * gate_factor) @ b_dh + b_dv_existing = k_gated @ b_dh + dv_existing
+    #   term2 = w_blk^T @ b_dv = w^T @ (k_gated @ b_dh + dv_existing) = M @ b_dh + c
+    #   b_dh' = b_dh * exp_bg_last + term1 - M @ b_dh - c = A @ b_dh + B
+    #     A = exp_bg_last * I - M,  B = term1 - c
+    if n_full > 0 and not npu_mode:
+        k_gated_full = kf_full * gate_factor_full                             # [B, Hv, n_full, BT, K]
+        _flat_wt = wf_full_T.reshape(B * Hv * n_full, K, BT)
+        _flat_kg = k_gated_full.reshape(B * Hv * n_full, BT, K)
+        _flat_dv = dvf_full.reshape(B * Hv * n_full, BT, V)
+        M_full = torch.bmm(_flat_wt, _flat_kg).reshape(B, Hv, n_full, K, K)   # w^T @ k_gated
+        c_full = torch.bmm(_flat_wt, _flat_dv).reshape(B, Hv, n_full, K, V)   # w^T @ dv_existing
+        A_full = exp_bg_last_expanded * torch.eye(K, device=device, dtype=compute_dtype) - M_full
+        B_full = term1_full - c_full
+
+    def _per_chunk_step(gs, ge, global_last_idx, b_dh):
+        """ragged tail / varlen per-chunk 路径（保留原始 gate_exp 计算顺序）。"""
+        k_blk = kf[:, :, gs:ge, :]
+        q_blk_ = qf[:, :, gs:ge, :]
+        w_blk = wf[:, :, gs:ge, :]
+        b_do = dof[:, :, gs:ge, :]
+        b_dv_existing = dvf[:, :, gs:ge, :]
+        bg_last = g_seq[:, :, global_last_idx]
+        b_g = g_seq[:, :, gs:ge]
+        gate_factor = gate_exp(bg_last.unsqueeze(-1) - b_g).unsqueeze(-1)
+        b_dh_rd = round_dt(b_dh)
+        b_dv = k_blk @ b_dh_rd
+        b_dv = round_dt(b_dv)
+        b_dv = b_dv * gate_factor + b_dv_existing
+        dv2[:, :, gs:ge, :] = b_dv.to(dtype_)
+        b_dh_for_update = b_dh * gate_exp(bg_last).unsqueeze(-1).unsqueeze(-1)
+        b_q_gated = q_blk_.transpose(-1, -2) * gate_exp(b_g).unsqueeze(-2)
+        b_q_gated_rd = round_dt(b_q_gated)
+        term1 = b_q_gated_rd @ b_do
+        term1 = round_dt(term1)
+        term1 = term1 * scale_f
+        b_dv_rd = round_dt(b_dv)
+        term2 = w_blk.transpose(-1, -2) @ b_dv_rd
+        term2 = round_dt(term2)
+        return b_dh_for_update + term1 - term2
+
+    # ---- 主循环：按模式拆分，循环内零分支 ----
+    if varlen:
+        for i_t in range(NT - 1, -1, -1):
             i_n = chunk_indices[i_t * 2]
             block_idx_in_token = chunk_indices[i_t * 2 + 1]
             bos = cu_seqlens[i_n]
@@ -315,69 +363,40 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
             gs = bos + start_t
             ge = bos + end_t
             b_dh = b_dh_buffers[:, :, i_n, :, :]
-        else:
+            dh[:, :, i_t, :, :] = b_dh
+            last_idx = min((block_idx_in_token + 1) * BT, token_length) - 1
+            global_last_idx = bos + last_idx
+            b_dh = _per_chunk_step(gs, ge, global_last_idx, b_dh)
+            b_dh_buffers[:, :, i_n, :, :] = b_dh
+    else:
+        # 定长模式：先 ragged tail（若有），再满 chunk 批量路径
+        if _ragged > 0:
+            i_t = n_full
             gs = i_t * BT
-            ge = min(gs + BT, T)
-            token_length = T
-            block_idx_in_token = i_t
-            bos = 0
-        dh[:, :, i_t, :, :] = b_dh
-        last_idx = min((block_idx_in_token + 1) * BT, token_length) - 1
-        global_last_idx = bos + last_idx
+            ge = T
+            dh[:, :, i_t, :, :] = b_dh
+            b_dh = _per_chunk_step(gs, ge, T - 1, b_dh)
 
-        # 满 chunk 走预计算分支；ragged tail / varlen 走原 per-chunk 分支
-        if not varlen and i_t < n_full:
-            b_idx = i_t
-            k_blk = kf_full[:, :, b_idx, :, :]          # [B, Hv, BT, K]
-            w_blk = wf_full[:, :, b_idx, :, :]          # [B, Hv, BT, K]
-            b_dv_existing = dvf_full[:, :, b_idx, :, :]  # [B, Hv, BT, V]
-            gate_factor = gate_factor_full[:, :, b_idx, :, :]  # [B, Hv, BT, 1]
-            exp_bg_last = exp_bg_last_full[:, :, b_idx]         # [B, Hv]
-            term1 = term1_full[:, :, b_idx, :, :]                # [B, Hv, K, V]
-
-            b_dh_rd = round_dt(b_dh)
-            b_dv = k_blk @ b_dh_rd
-            b_dv = round_dt(b_dv)
-            b_dv = b_dv * gate_factor + b_dv_existing
-            dv2_full_pre[:, :, i_t] = b_dv
-            b_dh_for_update = b_dh * exp_bg_last.unsqueeze(-1).unsqueeze(-1)
-            b_dv_rd = round_dt(b_dv)
-            term2 = w_blk.transpose(-1, -2) @ b_dv_rd
-            term2 = round_dt(term2)
-            b_dh = b_dh_for_update + term1 - term2
+        # 满 chunk：fp64 走预计算 A/B 路径，npu 走原路径（DT 量化不可合并）
+        if not npu_mode:
+            for i_t in range(n_full - 1, -1, -1):
+                dh[:, :, i_t, :, :] = b_dh
+                b_dv = k_gated_full[:, :, i_t] @ b_dh + dvf_full[:, :, i_t]
+                dv2_full_pre[:, :, i_t] = b_dv
+                b_dh = A_full[:, :, i_t] @ b_dh + B_full[:, :, i_t]
         else:
-            # --- 变长 / ragged tail：per-chunk 路径（保留原始 gate_exp 计算顺序）---
-            k_blk = kf[:, :, gs:ge, :]
-            q_blk_ = qf[:, :, gs:ge, :]  # kf/qf 已在循环外 repeat_interleave 展开 GVA
-            w_blk = wf[:, :, gs:ge, :]
-            b_do = dof[:, :, gs:ge, :]
-            b_dv_existing = dvf[:, :, gs:ge, :]
-
-            bg_last = g_seq[:, :, global_last_idx]
-            b_g = g_seq[:, :, gs:ge]
-
-            gate_factor = gate_exp(bg_last.unsqueeze(-1) - b_g).unsqueeze(-1)       # [B, Hv, bt, 1]
-
-            # ---- dvState ----
-            b_dh_rd = round_dt(b_dh)
-            b_dv = k_blk @ b_dh_rd
-            b_dv = round_dt(b_dv)
-            b_dv = b_dv * gate_factor + b_dv_existing
-            dv2[:, :, gs:ge, :] = b_dv.to(dtype_)
-
-            b_dh_for_update = b_dh * gate_exp(bg_last).unsqueeze(-1).unsqueeze(-1)
-            b_q_gated = q_blk_.transpose(-1, -2) * gate_exp(b_g).unsqueeze(-2)
-            b_q_gated_rd = round_dt(b_q_gated)
-            term1 = b_q_gated_rd @ b_do
-            term1 = round_dt(term1)
-            term1 = term1 * scale_f
-            b_dv_rd = round_dt(b_dv)
-            term2 = w_blk.transpose(-1, -2) @ b_dv_rd
-            term2 = round_dt(term2)
-            b_dh = b_dh_for_update + term1 - term2
-            if varlen:
-                b_dh_buffers[:, :, i_n, :, :] = b_dh
-            continue
+            for i_t in range(n_full - 1, -1, -1):
+                dh[:, :, i_t, :, :] = b_dh
+                b_dh_rd = round_dt(b_dh)
+                b_dv = kf_full[:, :, i_t] @ b_dh_rd
+                b_dv = round_dt(b_dv)
+                b_dv = b_dv * gate_factor_full[:, :, i_t] + dvf_full[:, :, i_t]
+                dv2_full_pre[:, :, i_t] = b_dv
+                b_dh_for_update = b_dh * exp_bg_last_expanded[:, :, i_t]
+                b_dv_rd = round_dt(b_dv)
+                term2 = wf_full_T[:, :, i_t] @ b_dv_rd
+                term2 = round_dt(term2)
+                b_dh = b_dh_for_update + term1_full[:, :, i_t] - term2
 
     if dv2_full_pre is not None:
         T_full = n_full * BT
