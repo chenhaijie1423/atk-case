@@ -256,7 +256,9 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
         return torch.exp(x * _LN2) if use_exp2 else torch.exp(x)
     # dh/dv2 输出 dtype 与 q 一致：低位宽轮（bf16/fp16）与 NPU 输出 dtype
     # 对齐（ATK 双标杆的 local/remote dtype 检查），升精度轮为 fp32。
-    dh = torch.zeros(B, Hv, NT, K, V, device=device, dtype=dtype_)
+    # dh_states 中间态缓冲（compute_dtype）：循环内按 compute_dtype 写，避免
+    # 逐 chunk 的 dtype 转换；循环结束后一次性 to(dtype_) 得到 dh。
+    dh_states = torch.empty(B, Hv, NT, K, V, device=device, dtype=compute_dtype)
     # 变长模式下未被 chunk 覆盖的 [seq_total, T) 位置保持 dv 原值。
     dv2 = dv.clone() if varlen else torch.zeros(B, Hv, T, V, device=device, dtype=dtype_)
     num_tokens = len(cu_seqlens) - 1 if varlen else 1
@@ -294,7 +296,7 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
         q_gated_f = (qf_chunks.transpose(-1, -2) * exp_g_full.unsqueeze(3))            # [B, Hv, n_full, K, BT]
         do_flat = dof_chunks.reshape(B * Hv * n_full, BT, V)                            # [BHv*N, BT, V]
         q_flat = q_gated_f.reshape(B * Hv * n_full, K, BT)                              # [BHv*N, K, BT]
-        term1_f = round_dt(round_dt(torch.bmm(q_flat, do_flat))) * scale_f               # [BHv*N, K, V]
+        term1_f = round_dt(torch.bmm(q_flat, do_flat)) * scale_f                          # [BHv*N, K, V]
         term1_full = term1_f.reshape(B, Hv, n_full, K, V)                                # [B, Hv, n_full, K, V]
 
         # 满 chunk 数据 reshape 为 [B, Hv, n_full, BT, D]，循环内 O(1) 索引
@@ -363,7 +365,7 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
             gs = bos + start_t
             ge = bos + end_t
             b_dh = b_dh_buffers[:, :, i_n, :, :]
-            dh[:, :, i_t, :, :] = b_dh
+            dh_states[:, :, i_t, :, :] = b_dh
             last_idx = min((block_idx_in_token + 1) * BT, token_length) - 1
             global_last_idx = bos + last_idx
             b_dh = _per_chunk_step(gs, ge, global_last_idx, b_dh)
@@ -374,19 +376,19 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
             i_t = n_full
             gs = i_t * BT
             ge = T
-            dh[:, :, i_t, :, :] = b_dh
+            dh_states[:, :, i_t, :, :] = b_dh
             b_dh = _per_chunk_step(gs, ge, T - 1, b_dh)
 
         # 满 chunk：fp64 走预计算 A/B 路径，npu 走原路径（DT 量化不可合并）
         if not npu_mode:
             for i_t in range(n_full - 1, -1, -1):
-                dh[:, :, i_t, :, :] = b_dh
+                dh_states[:, :, i_t, :, :] = b_dh
                 b_dv = k_gated_full[:, :, i_t] @ b_dh + dvf_full[:, :, i_t]
                 dv2_full_pre[:, :, i_t] = b_dv
                 b_dh = A_full[:, :, i_t] @ b_dh + B_full[:, :, i_t]
         else:
             for i_t in range(n_full - 1, -1, -1):
-                dh[:, :, i_t, :, :] = b_dh
+                dh_states[:, :, i_t, :, :] = b_dh
                 b_dh_rd = round_dt(b_dh)
                 b_dv = kf_full[:, :, i_t] @ b_dh_rd
                 b_dv = round_dt(b_dv)
@@ -402,6 +404,7 @@ def chunk_gated_delta_rule_bwd_dhu_golden(
         T_full = n_full * BT
         dv2[:, :, :T_full, :] = dv2_full_pre.reshape(B, Hv, T_full, V).to(dtype_)
 
+    dh = dh_states.to(dtype_)
     return dh, dv2
 
 
@@ -499,25 +502,21 @@ class FunctionApi(BaseApi):
             if self.device in {"npu", "pyaclnn"}:
                 from fla_npu.ops import ascendc
 
-                res = _finite_tuple(
-                    ascendc.chunk_gated_delta_rule_bwd_dhu(
-                        q, k, w, dO, dv, scale, chunk_size,
-                        g=g, gK=None, h0=None, dht=None,
-                        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
-                        use_exp2=use_exp2, transpose_state_layout=False,
-                    ),
-                    golden=False,
+                dh, dv2 = ascendc.chunk_gated_delta_rule_bwd_dhu(
+                    q, k, w, dO, dv, scale, chunk_size,
+                    g=g, gK=None, h0=None, dht=None,
+                    cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+                    use_exp2=use_exp2, transpose_state_layout=False,
                 )
             elif self.device == "cpu" or self.device == "gpu":
                 dh, dv2 = chunk_gated_delta_rule_bwd_dhu_golden(
                     q, k, w, dO, dv, g, scale, chunk_size,
                     use_exp2=use_exp2, cu_seqlens=cu_seqlens,
                     chunk_indices=chunk_indices)
-                res = _finite_tuple((dh, None, dv2), golden=True)
             else:
                 raise RuntimeError(
                     f"{OP_NAME} 仅支持 NPU DUT 与 CPU 标杆节点，当前设备：{self.device!r}")
-        return res
+        return dh, dv2
 
 
 @register("executor_chunk_gated_delta_rule_bwd_dhu_aclnn")
